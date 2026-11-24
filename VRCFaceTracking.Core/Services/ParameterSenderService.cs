@@ -2,6 +2,7 @@ using VRCFaceTracking.Core.Contracts;
 using VRCFaceTracking.Core.Models.ParameterDefinition;
 using VRCFaceTracking.Core.OSC;
 using VRCFaceTracking.Core.Params.Data;
+using Microsoft.Extensions.Logging;
 
 namespace VRCFaceTracking.Core.Services;
 
@@ -14,6 +15,7 @@ public class ParameterSenderService
 
     private readonly OscSendService _sendService;
     private readonly UnifiedTrackingMutator _mutator; // We don't use this but we do want DI to run its constructor
+    private readonly ILogger<ParameterSenderService> _logger;
 
     private readonly SemaphoreSlim _flushLock = new(1, 1);
 
@@ -36,10 +38,11 @@ public class ParameterSenderService
         }
     }
 
-    public ParameterSenderService(OscSendService sendService, UnifiedTrackingMutator mutator)
+    public ParameterSenderService(OscSendService sendService, UnifiedTrackingMutator mutator, ILogger<ParameterSenderService> logger)
     {
         _sendService = sendService;
         _mutator = mutator;
+        _logger = logger;
     }
 
     public static void Enqueue(OscMessage message)
@@ -75,7 +78,7 @@ public class ParameterSenderService
         }
         catch (Exception e)
         {
-            SentrySdk.CaptureException(e);
+            _logger.LogError(e, "Could not flush OSC parameter queue");
         }
         finally
         {

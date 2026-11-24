@@ -77,13 +77,6 @@ public partial class ModuleProcessMain
                 .ClearProviders()
                 .AddDebug()
                 .AddConsole()
-                .AddSentry(o =>
-                {
-                    o.Dsn = VrcftSentry.Dsn;
-                    o.MinimumBreadcrumbLevel = LogLevel.Error;
-                    o.MinimumEventLevel = LogLevel.Critical;
-                    o.MaxBreadcrumbs = 50;
-                })
                 .AddProvider(new ProxyLoggerProvider())
             )
         .BuildServiceProvider();

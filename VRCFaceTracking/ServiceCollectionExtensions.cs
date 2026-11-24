@@ -28,13 +28,6 @@ public static class ServiceCollectionExtensions
             logging.AddProvider(new OutputPageLogProvider());
             logging.AddProvider(new LogFileProvider());
             logging.AddProvider(logBuffer);
-            logging.AddSentry(o =>
-            {
-                o.Dsn = VrcftSentry.Dsn;
-                o.MinimumBreadcrumbLevel = LogLevel.Error;
-                o.MinimumEventLevel = LogLevel.Critical;
-                o.MaxBreadcrumbs = 50;
-            });
 
             logging.AddFilter<OutputPageLogProvider>(null, LogLevel.Information);
         });
