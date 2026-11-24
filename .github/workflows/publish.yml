@@ -1,87 +1,146 @@
-name: Steam Publish
+name: Release
+
 on:
   push:
-    branches:
-      - master
-      - 'refactor/avalonia'
+    branches: [master, develop, 'refactor/avalonia']
+    tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-24.04
+  build:
+    name: Build ${{ matrix.rid }} AppImage
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            arch: x86_64
+            runner: ubuntu-22.04
+          - rid: linux-arm64
+            arch: aarch64
+            runner: ubuntu-22.04-arm
+    env:
+      RID: ${{ matrix.rid }}
+      ARCH: ${{ matrix.arch }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      #- name: Install Crowdin CLI
-      #  run: npm install -g @crowdin/cli
-
-      #- name: Download latest translations
-      #  run: crowdin download
-      #  env:
-      #    CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
 
-      - name: Restore dependencies
-        run: dotnet restore
-
-      - name: Publish Windows (x64)
+      - name: Publish application and module host
         run: |
-          dotnet publish VRCFaceTracking/VRCFaceTracking.csproj --configuration Release -r win-x64 --output ./publish/windows
-          dotnet publish VRCFaceTracking.ModuleProcess/VRCFaceTracking.ModuleProcess.csproj --configuration Release -r win-x64 --output ./publish/windows
+          for project in VRCFaceTracking VRCFaceTracking.ModuleProcess; do
+            dotnet publish "$project/$project.csproj" -c Release -r "$RID" \
+              --self-contained true -o "$RUNNER_TEMP/AppDir/usr/bin"
+          done
 
-      - name: Publish Linux (x64)
+      - name: Package AppImage
         run: |
-          dotnet publish VRCFaceTracking/VRCFaceTracking.csproj --configuration Release -r linux-x64 --output ./publish/linux
-          dotnet publish VRCFaceTracking.ModuleProcess/VRCFaceTracking.ModuleProcess.csproj --configuration Release -r linux-x64 --output ./publish/linux
+          appdir="$RUNNER_TEMP/AppDir"
+          install -m 755 packaging/appimage/AppRun "$appdir/"
+          install -m 644 packaging/appimage/VRCFaceTracking.desktop "$appdir/"
+          install -m 644 VRCFaceTracking/Assets/Square44x44Logo.targetsize-256.png "$appdir/VRCFaceTracking.png"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$ARCH.AppImage"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run "$appdir" "VRCFaceTracking-$ARCH.AppImage"
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: publish-windows
-          path: publish/windows/**
-
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: publish-linux
-          path: publish/linux/**
-
-      - name: Get version
-        id: package_version
-        uses: KageKirin/get-csproj-version@v1.0.0
-        with:
-          file: Directory.Build.props
-          xpath: //PropertyGroup/AssemblyVersion
-          regex: '^(?<major>0|[1-9]\d*)\.(?<minor>0|[1-9]\d*)\.(?<patch>0|[1-9]\d*)\.(?<build>0|[1-9]\d*)$'
-
-      - name: Determine Steam branch
-        id: steam_branch
+      - name: Check packaged application
         run: |
-          REF_NAME="${{ github.ref_name }}"
-          if [ "$REF_NAME" = "master" ]; then
-            BRANCH="development"
-          else
-            BRANCH="${REF_NAME##*/}"
+          image="$GITHUB_WORKSPACE/VRCFaceTracking-$ARCH.AppImage"
+          cd "$RUNNER_TEMP"
+          "$image" --appimage-extract > /dev/null
+          bin=squashfs-root/usr/bin
+          test -x "$bin/VRCFaceTracking.ModuleProcess"
+          for library in libcoreclr.so libhostfxr.so fti_osc.so libopenvr_api.so; do
+            test -s "$bin/$library"
+          done
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth xdotool
+          xvfb-run -a bash -ec '
+            ./squashfs-root/AppRun &
+            app_pid=$!
+            trap "kill $app_pid 2>/dev/null || true" EXIT
+            timeout 60 xdotool search --sync --onlyvisible --name "^VRCFaceTracking$"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRCFaceTracking-${{ matrix.arch }}
+          path: VRCFaceTracking-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  build-windows:
+    name: Build Windows x64 ZIP
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish application and module host
+        run: |
+          for project in VRCFaceTracking VRCFaceTracking.ModuleProcess; do
+            dotnet publish "$project/$project.csproj" -c Release -r win-x64 \
+              --self-contained true -o "$RUNNER_TEMP/windows-x64"
+          done
+
+      - name: Package Windows ZIP
+        run: |
+          cd "$RUNNER_TEMP/windows-x64"
+          for file in VRCFaceTracking.exe VRCFaceTracking.ModuleProcess.exe coreclr.dll hostfxr.dll openvr_api.dll; do
+            test -s "$file"
+          done
+          zip -r "$GITHUB_WORKSPACE/VRCFaceTracking-windows-x64.zip" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRCFaceTracking-windows-x64
+          path: VRCFaceTracking-windows-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Create GitHub release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check that the tag is on master
+        id: master
+        run: |
+          if git merge-base --is-ancestor HEAD refs/remotes/origin/master; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "Publishing to Steam branch: $BRANCH"
-
-      - name: Deploy to Steam
-        if: github.event_name == 'push'
-        env:
-          steam_username: ${{ secrets.STEAM_USERNAME }}
-          steam_config_vdf: ${{ secrets.STEAM_CONFIG_VDF }}
-        uses: game-ci/steam-deploy@v3
+      - uses: actions/download-artifact@v4
+        if: steps.master.outputs.eligible == 'true'
         with:
-          username: ${{ secrets.STEAM_USERNAME }}
-          configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
-          appId: 3329480
-          buildDescription: ${{ steps.package_version.outputs.version }}
-          depot1Path: publish/windows
-          depot2Path: publish/linux
-          releaseBranch: ${{ steps.steam_branch.outputs.branch }}
+          pattern: VRCFaceTracking-{x86_64,aarch64}
+          merge-multiple: true
+          path: dist
+      - name: Publish release packages
+        if: steps.master.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          packages=(dist/VRCFaceTracking-{x86_64,aarch64}.AppImage)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${packages[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "${packages[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes
+          fi
