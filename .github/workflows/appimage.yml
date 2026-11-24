@@ -1,0 +1,100 @@
+name: Linux AppImages
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.rid }} AppImage
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: linux-x64
+            arch: x86_64
+            runner: ubuntu-22.04
+          - rid: linux-arm64
+            arch: aarch64
+            runner: ubuntu-22.04-arm
+    env:
+      RID: ${{ matrix.rid }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish application and module host
+        run: |
+          for project in VRCFaceTracking VRCFaceTracking.ModuleProcess; do
+            dotnet publish "$project/$project.csproj" -c Release -r "$RID" \
+              --self-contained true -o "$RUNNER_TEMP/AppDir/usr/bin"
+          done
+
+      - name: Package AppImage
+        run: |
+          appdir="$RUNNER_TEMP/AppDir"
+          install -m 755 packaging/appimage/AppRun "$appdir/"
+          install -m 644 packaging/appimage/VRCFaceTracking.desktop "$appdir/"
+          install -m 644 VRCFaceTracking/Assets/Square44x44Logo.targetsize-256.png "$appdir/VRCFaceTracking.png"
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$ARCH.AppImage"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          "$RUNNER_TEMP/appimagetool" --appimage-extract-and-run "$appdir" "VRCFaceTracking-$ARCH.AppImage"
+
+      - name: Check packaged application
+        run: |
+          image="$GITHUB_WORKSPACE/VRCFaceTracking-$ARCH.AppImage"
+          cd "$RUNNER_TEMP"
+          "$image" --appimage-extract > /dev/null
+          bin=squashfs-root/usr/bin
+          test -x "$bin/VRCFaceTracking.ModuleProcess"
+          for library in libcoreclr.so libhostfxr.so fti_osc.so libopenvr_api.so; do
+            test -s "$bin/$library"
+          done
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth xdotool
+          xvfb-run -a bash -ec '
+            ./squashfs-root/AppRun &
+            app_pid=$!
+            trap "kill $app_pid 2>/dev/null || true" EXIT
+            timeout 60 xdotool search --sync --onlyvisible --name "^VRCFaceTracking$"
+          '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VRCFaceTracking-${{ matrix.arch }}
+          path: VRCFaceTracking-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Attach AppImages to release
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: VRCFaceTracking-*
+          merge-multiple: true
+          path: dist
+      - name: Upload both architectures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" dist/VRCFaceTracking-{x86_64,aarch64}.AppImage \
+            --repo "$GITHUB_REPOSITORY" --clobber

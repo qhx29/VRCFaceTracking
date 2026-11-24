@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+# ModuleProcess and appsettings.json are resolved from the working directory.
+cd "$(dirname "$(readlink -f "$0")")/usr/bin"
+exec ./VRCFaceTracking "$@"
