@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using System.Collections.Concurrent;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -13,12 +14,13 @@ public partial class MulticastDnsService : ObservableObject
     private static readonly IPAddress MulticastIp = IPAddress.Parse("224.0.0.251");
     private const int MulticastPost = 5353;
     private static readonly IPEndPoint MdnsEndpointIp4 = new(MulticastIp, MulticastPost);
-    private readonly List<IPAddress> _localIpAddresses;
+    private readonly List<IPAddress> _localIpAddresses = new();
     private readonly ILogger<MulticastDnsService> _logger;
 
     private static readonly Dictionary<IPAddress, UdpClient> Senders = new();
     private static readonly Dictionary<UdpClient, CancellationToken> Receivers = new();
     private static readonly Dictionary<string, AdvertisedService> Services = new();
+    private static readonly ConcurrentDictionary<IPAddress, byte> FailedSenders = new();
 
     public Action OnVrcClientDiscovered = () => { };
 
@@ -42,8 +44,6 @@ public partial class MulticastDnsService : ObservableObject
     {
         _logger = logger;
 
-        _localIpAddresses = GetIpv4NetInterfaces().Select(GetIpv4Address).Where(addr => addr != null).ToList();
-
         // Create listeners for all interfaces
         var cts = new CancellationTokenSource();
         var receiver = new UdpClient(AddressFamily.InterNetwork);
@@ -54,20 +54,43 @@ public partial class MulticastDnsService : ObservableObject
 
 
         // For every ipv4 address discovered in the network interfaces, create a sender udp client set up grouping
-        foreach (var ipAddress in _localIpAddresses)
+        foreach (var net in GetIpv4NetInterfaces())
         {
-            // Add the local ip address to our multicast group
-            receiver.JoinMulticastGroup(MulticastIp, ipAddress);
+            var ipAddress = GetIpv4Address(net);
+            if (ipAddress == null)
+                continue;
+            if (Senders.ContainsKey(ipAddress))
+            {
+                _logger.LogWarning("Skipping mDNS interface {InterfaceName}: address {Address} is already in use", net.Name, ipAddress);
+                continue;
+            }
 
-            var sender = new UdpClient(ipAddress.AddressFamily);
-            sender.Client.ExclusiveAddressUse = false;
-            sender.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            sender.Client.Bind(new IPEndPoint(ipAddress, MulticastPost));    // Bind to the local ip address
-            sender.JoinMulticastGroup(MulticastIp, ipAddress);                           // Join the multicast group
-            sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, true);
+            UdpClient? sender = null;
+            try
+            {
+                sender = new UdpClient(ipAddress.AddressFamily);
+                sender.Client.ExclusiveAddressUse = false;
+                sender.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                sender.Client.Bind(new IPEndPoint(ipAddress, MulticastPost));
+                sender.JoinMulticastGroup(MulticastIp, ipAddress);
+                sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, ipAddress.GetAddressBytes());
+                sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, true);
+                receiver.JoinMulticastGroup(MulticastIp, ipAddress);
 
-            Receivers.Add(sender, cts.Token);
-            Senders.Add(ipAddress, sender);
+                _localIpAddresses.Add(ipAddress);
+                Receivers.Add(sender, cts.Token);
+                Senders.Add(ipAddress, sender);
+            }
+            catch (SocketException e)
+            {
+                sender?.Dispose();
+                _logger.LogWarning(e, "Could not initialize mDNS on interface {InterfaceName} ({Address})", net.Name, ipAddress);
+            }
+        }
+
+        if (Senders.Count == 0)
+        {
+            _logger.LogWarning("No mDNS interfaces are available; automatic OSCQuery discovery will not work");
         }
 
         foreach (var sender in Receivers)
@@ -153,10 +176,7 @@ public partial class MulticastDnsService : ObservableObject
 
                 if (remoteEndpoint.Port == MulticastPost)
                 {
-                    foreach (var sender in Senders)
-                    {
-                        await sender.Value.SendAsync(bytes, bytes.Length, MdnsEndpointIp4);
-                    }
+                    await SendMulticastAsync(bytes);
 
                     continue;
                 }
@@ -177,13 +197,29 @@ public partial class MulticastDnsService : ObservableObject
         dnsPacket.TRUNCATION = false;
 
         var bytes = dnsPacket.Serialize();
-        foreach (var sender in Senders)
-        {
-            await sender.Value.SendAsync(bytes, bytes.Length, MdnsEndpointIp4);
-        }
+        await SendMulticastAsync(bytes);
 
         //var unicastClientIp4 = new UdpClient(AddressFamily.InterNetwork);
         //await unicastClientIp4.SendAsync(bytes, bytes.Length, remoteEndpoint);
+    }
+
+    private async Task SendMulticastAsync(byte[] bytes)
+    {
+        foreach (var sender in Senders)
+        {
+            if (FailedSenders.ContainsKey(sender.Key))
+                continue;
+
+            try
+            {
+                await sender.Value.SendAsync(bytes, bytes.Length, MdnsEndpointIp4);
+            }
+            catch (SocketException e)
+            {
+                if (FailedSenders.TryAdd(sender.Key, 0))
+                    _logger.LogWarning(e, "Could not send mDNS packet on address {Address}; skipping this interface until restart", sender.Key);
+            }
+        }
     }
 
     public void ResolveVrChatClient(DnsPacket packet, IPEndPoint remoteEndpoint)
@@ -260,7 +296,7 @@ public partial class MulticastDnsService : ObservableObject
             }
             catch (Exception e)
             {
-                SentrySdk.CaptureException(e, scope => scope.SetExtra("bytes", result.Buffer));
+                _logger.LogError(e, "Error parsing mDNS packet");
             }
         }
     }
