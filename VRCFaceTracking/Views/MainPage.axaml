@@ -101,7 +101,7 @@
                                 <TextBlock FontSize="12" Opacity="0.7" Text="  Send:" />
                                 <TextBlock FontSize="12" Text="{Binding OscTarget.OutPort, Mode=OneWay}" />
                                 <TextBlock FontSize="12" Opacity="0.7" Text=" @" />
-                                <TextBlock FontSize="12" Text="{Binding OscTarget.DestinationAddress, Mode=OneWay}" />
+                                <TextBlock FontSize="12" Text="{Binding OscTarget.OutputAddress, Mode=OneWay}" />
                             </StackPanel>
                             <TextBlock FontSize="12" Opacity="0.5" Text="Not connected"
                                        IsVisible="{Binding !OscTarget.IsConnected}" />

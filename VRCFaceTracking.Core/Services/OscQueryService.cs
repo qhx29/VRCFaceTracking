@@ -21,7 +21,6 @@ public partial class OscQueryService(
     IOscTarget oscTarget,
     MulticastDnsService multicastDnsService,
     OscRecvService recvService,
-    ILocalSettingsService settingsService,
     HttpHandler httpHandler,
     IDispatcherService dispatcherService)
     : ObservableObject
@@ -40,14 +39,9 @@ public partial class OscQueryService(
 
         recvService.OnMessageReceived = HandleNewMessage;
 
-        await settingsService.Load(oscTarget);
+        await oscTarget.LoadSettingsAsync();
 
         (bool listenerSuccess, bool senderSuccess) result = (false, false);
-
-        if (string.IsNullOrWhiteSpace(oscTarget.DestinationAddress))
-        {
-            return;  // Return both false as we cant bind to anything without an address
-        }
 
         multicastDnsService.OnVrcClientDiscovered += FirstClientDiscovered;
 
@@ -65,11 +59,11 @@ public partial class OscQueryService(
 
         httpHandler.OnHostInfoQueried += HandleNewAvatarWrapper;
 
-        var recvEndpoint = recvService.UpdateTarget(new IPEndPoint(IPAddress.Parse(oscTarget.DestinationAddress), 0));
+        var recvEndpoint = recvService.UpdateTarget(new IPEndPoint(IPAddress.Loopback, 0));
         if (recvEndpoint == null)
         {
             logger.LogError("Very strange. We were unable to bind to a random port.");
-            recvEndpoint = new IPEndPoint(IPAddress.Parse(oscTarget.DestinationAddress), oscTarget.InPort);
+            recvEndpoint = new IPEndPoint(IPAddress.Loopback, oscTarget.InPort);
         }
 
         var randomServiceSuffix = Utils.GetRandomChars(6);

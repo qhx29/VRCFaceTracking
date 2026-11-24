@@ -1,10 +1,8 @@
-﻿using System.ComponentModel.DataAnnotations;
-using System.Net;
+﻿using System.Net;
 using System.Net.Sockets;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.Contracts;
-using VRCFaceTracking.Core.Contracts.Services;
 using VRCFaceTracking.Core.OSC;
 
 namespace VRCFaceTracking.Core.Services;
@@ -13,7 +11,6 @@ public class OscRecvService : BackgroundService
 {
     private readonly ILogger<OscRecvService> _logger;
     private readonly IOscTarget _oscTarget;
-    private readonly ILocalSettingsService _settingsService;
 
     private Socket _recvSocket;
     private readonly byte[] _recvBuffer = new byte[4096];
@@ -25,42 +22,24 @@ public class OscRecvService : BackgroundService
 
     public OscRecvService(
         ILogger<OscRecvService> logger,
-        IOscTarget oscTarget,
-        ILocalSettingsService settingsService
+        IOscTarget oscTarget
     )
     {
         _logger = logger;
         _cts = new CancellationTokenSource();
 
         _oscTarget = oscTarget;
-        _settingsService = settingsService;
 
         _oscTarget.PropertyChanged += (_, args) =>
         {
-            if (args.PropertyName == nameof(_oscTarget.IsConnected))
-                return;
-            
-            var validationResults = new List<ValidationResult>();
-            var context = new ValidationContext(_oscTarget);
-    
-            if (!Validator.TryValidateObject(_oscTarget, context, validationResults, validateAllProperties: true))
-            {
-                var errorMessages = string.Join(Environment.NewLine, validationResults.Select(v => v.ErrorMessage));
-                //_logger.LogWarning($"{errorMessages} Reverting to default.");
-                if (_oscTarget.DestinationAddress != "127.0.0.1")
-                {
-                    _oscTarget.DestinationAddress = "127.0.0.1";
-                }
-                return;
-            }
-
-            UpdateTarget(new IPEndPoint(IPAddress.Parse(_oscTarget.DestinationAddress), _oscTarget.InPort));
+            if (args.PropertyName == nameof(IOscTarget.InPort) && _oscTarget.InPort is > 0 and <= 65535)
+                UpdateTarget(new IPEndPoint(IPAddress.Loopback, _oscTarget.InPort));
         };
     }
 
     public async override Task StartAsync(CancellationToken cancellationToken)
     {
-        await _settingsService.Load(_oscTarget);
+        await _oscTarget.LoadSettingsAsync();
 
         await base.StartAsync(cancellationToken);
     }

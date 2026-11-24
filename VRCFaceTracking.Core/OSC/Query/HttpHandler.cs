@@ -1,10 +1,9 @@
 ﻿using System.Net;
 using Microsoft.Extensions.Logging;
-using VRCFaceTracking.Core.Contracts;
 
 namespace VRCFaceTracking.Core.OSC.Query.mDNS;
 
-public class HttpHandler(IOscTarget oscTarget, ILogger<HttpHandler> logger) : IDisposable
+public class HttpHandler(ILogger<HttpHandler> logger) : IDisposable
 {
     private readonly HttpListener _listener = new();
     private IAsyncResult _contextListenerResult;
@@ -42,7 +41,7 @@ public class HttpHandler(IOscTarget oscTarget, ILogger<HttpHandler> logger) : ID
             var hostInfo = new OscQueryHostInfo
             {
                 name = _appName,
-                oscIP = oscTarget.DestinationAddress,
+                oscIP = IPAddress.Loopback.ToString(),
                 oscPort = _oscPort
             };
             respStr = hostInfo.ToString();

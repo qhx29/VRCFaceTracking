@@ -34,6 +34,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<UnifiedTrackingMutator>();
 
         services.AddHostedService(p => p.GetRequiredService<OscRecvService>());
+        services.AddHostedService<SteamLinkOutputDiscovery>();
         services.AddHostedService<BinaryFaceDataSender>();
     }
 }

@@ -22,6 +22,12 @@ public interface IOscTarget : INotifyPropertyChanged
         set;
     }
     
+    Task LoadSettingsAsync();
+    bool AutomaticOutput { get; set; }
+    string? StreamingPeer { get; set; }
+    string OutputAddress { get; }
+    string OutputLabel { get; }
+
     public string DestinationAddress
     {
         get;
