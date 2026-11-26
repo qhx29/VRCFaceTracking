@@ -73,7 +73,10 @@ public partial class MulticastDnsService : ObservableObject
                 sender.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                 sender.Client.Bind(new IPEndPoint(ipAddress, MulticastPost));
                 sender.JoinMulticastGroup(MulticastIp, ipAddress);
-                sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, ipAddress.GetAddressBytes());
+                // On Linux, let the kernel route multicast as it did before per-interface
+                // socket setup. Pinning the egress interface can break local VRChat discovery.
+                if (!OperatingSystem.IsLinux())
+                    sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, ipAddress.GetAddressBytes());
                 sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, true);
                 receiver.JoinMulticastGroup(MulticastIp, ipAddress);
 
