@@ -1,7 +1,4 @@
 ﻿using System.Net;
-using System.Text.Json;
-using System.Text.RegularExpressions;
-using Microsoft.Extensions.Hosting;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.Contracts;
@@ -24,7 +21,6 @@ public partial class OscQueryService(
     MulticastDnsService multicastDnsService,
     OscRecvService recvService,
     HttpHandler httpHandler,
-    IHostApplicationLifetime lifetime,
     IDispatcherService dispatcherService)
     : ObservableObject
 {
@@ -51,55 +47,6 @@ public partial class OscQueryService(
 
         if (multicastDnsService.VrchatClientEndpoint != null)
             FirstClientDiscovered();
-
-        if (OperatingSystem.IsLinux())
-            _ = DiscoverLocalProtonClientAsync(lifetime.ApplicationStopping);
-    }
-
-    private async Task DiscoverLocalProtonClientAsync(CancellationToken token)
-    {
-        using var http = new HttpClient(new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false })
-        {
-            Timeout = TimeSpan.FromSeconds(2)
-        };
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
-        try
-        {
-            while (await timer.WaitForNextTickAsync(token) && multicastDnsService.VrchatClientEndpoint == null)
-            {
-                try
-                {
-                    var directory = Path.GetDirectoryName(VRChat.VRCOSCDirectory);
-                    if (!Directory.Exists(directory)) continue;
-                    var log = Directory.EnumerateFiles(directory, "output_log_*.txt")
-                        .MaxBy(Path.GetFileName, StringComparer.Ordinal);
-                    if (log == null) continue;
-
-                    var advertisement = File.ReadLines(log)
-                        .Select(line => Regex.Match(line, @"Advertising Service (VRChat-Client-[\w-]+) of type OSCQuery on (\d+)\s*$"))
-                        .FirstOrDefault(match => match.Success);
-                    if (advertisement == null || !ushort.TryParse(advertisement.Groups[2].Value, out var port) || port == 0)
-                        continue;
-
-                    var endpoint = new IPEndPoint(IPAddress.Loopback, port);
-                    using var info = JsonDocument.Parse(await http.GetStringAsync($"http://{endpoint}/?HOST_INFO", token));
-                    if (!info.RootElement.TryGetProperty("NAME", out var name) ||
-                        !name.ValueEquals(advertisement.Groups[1].Value) || multicastDnsService.VrchatClientEndpoint != null)
-                        continue;
-
-                    logger.LogInformation("Found local VRChat OSCQuery endpoint in Proton log at {Endpoint}", endpoint);
-                    multicastDnsService.VrchatClientEndpoint = endpoint;
-                    FirstClientDiscovered();
-                    return;
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException
-                    or JsonException or InvalidOperationException or TaskCanceledException)
-                {
-                    logger.LogDebug("Local VRChat OSCQuery endpoint unavailable: {Reason}", ex.Message);
-                }
-            }
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
     private void FirstClientDiscovered()
