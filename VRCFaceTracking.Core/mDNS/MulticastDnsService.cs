@@ -1,8 +1,6 @@
-﻿using System.Collections.Concurrent;
-using System.Net;
+﻿using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.OSC.Query.mDNS;
@@ -14,25 +12,16 @@ public partial class MulticastDnsService : ObservableObject
     private static readonly IPAddress MulticastIp = IPAddress.Parse("224.0.0.251");
     private const int MulticastPost = 5353;
     private static readonly IPEndPoint MdnsEndpointIp4 = new(MulticastIp, MulticastPost);
-    private readonly List<IPAddress> _localIpAddresses = new();
+    private readonly List<IPAddress> _localIpAddresses;
     private readonly ILogger<MulticastDnsService> _logger;
 
     private static readonly Dictionary<IPAddress, UdpClient> Senders = new();
     private static readonly Dictionary<UdpClient, CancellationToken> Receivers = new();
     private static readonly Dictionary<string, AdvertisedService> Services = new();
-    private static readonly ConcurrentDictionary<IPAddress, byte> FailedSenders = new();
 
     public Action OnVrcClientDiscovered = () => { };
 
     [ObservableProperty] private IPEndPoint _vrchatClientEndpoint;
-
-    private static List<NetworkInterface> GetIpv4NetInterfaces() => NetworkInterface.GetAllNetworkInterfaces()
-        .Where(net =>
-            net.OperationalStatus == OperationalStatus.Up &&
-            net.NetworkInterfaceType != NetworkInterfaceType.Loopback && (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || ( 
-            net.SupportsMulticast &&
-            net.GetIPProperties().MulticastAddresses.Count != 0)))
-        .ToList();
 
     // Get the first ipv4 address from a specific network interface
     private static IPAddress? GetIpv4Address(NetworkInterface net) => net.GetIPProperties()
@@ -44,6 +33,8 @@ public partial class MulticastDnsService : ObservableObject
     {
         _logger = logger;
 
+        _localIpAddresses = new();
+
         // Create listeners for all interfaces
         var cts = new CancellationTokenSource();
         var receiver = new UdpClient(AddressFamily.InterNetwork);
@@ -54,46 +45,35 @@ public partial class MulticastDnsService : ObservableObject
 
 
         // For every ipv4 address discovered in the network interfaces, create a sender udp client set up grouping
-        foreach (var net in GetIpv4NetInterfaces())
+        foreach (var net in NetworkInterface.GetAllNetworkInterfaces())
         {
-            var ipAddress = GetIpv4Address(net);
-            if (ipAddress == null)
-                continue;
-            if (Senders.ContainsKey(ipAddress))
-            {
-                _logger.LogWarning("Skipping mDNS interface {InterfaceName}: address {Address} is already in use", net.Name, ipAddress);
-                continue;
-            }
-
             UdpClient? sender = null;
             try
             {
+                if (net.OperationalStatus != OperationalStatus.Up || net.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                    (OperatingSystem.IsWindows() && (!net.SupportsMulticast || net.GetIPProperties().MulticastAddresses.Count == 0)))
+                    continue;
+
+                var ipAddress = GetIpv4Address(net);
+                if (ipAddress == null || _localIpAddresses.Contains(ipAddress)) continue;
+                _localIpAddresses.Add(ipAddress);
+
                 sender = new UdpClient(ipAddress.AddressFamily);
                 sender.Client.ExclusiveAddressUse = false;
                 sender.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                 sender.Client.Bind(new IPEndPoint(ipAddress, MulticastPost));
                 sender.JoinMulticastGroup(MulticastIp, ipAddress);
-                // On Linux, let the kernel route multicast as it did before per-interface
-                // socket setup. Pinning the egress interface can break local VRChat discovery.
-                if (!OperatingSystem.IsLinux())
-                    sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastInterface, ipAddress.GetAddressBytes());
                 sender.Client.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastLoopback, true);
                 receiver.JoinMulticastGroup(MulticastIp, ipAddress);
 
-                _localIpAddresses.Add(ipAddress);
                 Receivers.Add(sender, cts.Token);
                 Senders.Add(ipAddress, sender);
             }
-            catch (SocketException e)
+            catch (Exception ex) when (ex is SocketException or NetworkInformationException)
             {
                 sender?.Dispose();
-                _logger.LogWarning(e, "Could not initialize mDNS on interface {InterfaceName} ({Address})", net.Name, ipAddress);
+                _logger.LogWarning(ex, "Skipping mDNS on interface {Interface}", net.Name);
             }
-        }
-
-        if (Senders.Count == 0)
-        {
-            _logger.LogWarning("No mDNS interfaces are available; automatic OSCQuery discovery will not work");
         }
 
         foreach (var sender in Receivers)
@@ -199,28 +179,20 @@ public partial class MulticastDnsService : ObservableObject
         dnsPacket.OPCODE = 0;
         dnsPacket.TRUNCATION = false;
 
-        var bytes = dnsPacket.Serialize();
-        await SendMulticastAsync(bytes);
-
-        //var unicastClientIp4 = new UdpClient(AddressFamily.InterNetwork);
-        //await unicastClientIp4.SendAsync(bytes, bytes.Length, remoteEndpoint);
+        await SendMulticastAsync(dnsPacket.Serialize());
     }
 
     private async Task SendMulticastAsync(byte[] bytes)
     {
         foreach (var sender in Senders)
         {
-            if (FailedSenders.ContainsKey(sender.Key))
-                continue;
-
             try
             {
                 await sender.Value.SendAsync(bytes, bytes.Length, MdnsEndpointIp4);
             }
-            catch (SocketException e)
+            catch (SocketException ex)
             {
-                if (FailedSenders.TryAdd(sender.Key, 0))
-                    _logger.LogWarning(e, "Could not send mDNS packet on address {Address}; skipping this interface until restart", sender.Key);
+                _logger.LogWarning(ex, "Could not send mDNS on {Address}", sender.Key);
             }
         }
     }
@@ -279,7 +251,20 @@ public partial class MulticastDnsService : ObservableObject
     {
         while (!ct.IsCancellationRequested)
         {
-            var result = await client.ReceiveAsync(ct);
+            UdpReceiveResult result;
+            try
+            {
+                result = await client.ReceiveAsync(ct);
+            }
+            catch (SocketException ex)
+            {
+                _logger.LogWarning(ex, "Stopping mDNS listener on {Endpoint}", client.Client.LocalEndPoint);
+                return;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
 
             if (!_localIpAddresses.Any(i => i.Equals(result.RemoteEndPoint.Address)))
             {
