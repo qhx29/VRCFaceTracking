@@ -1,5 +1,7 @@
 ﻿using System.Net;
-using System.Net.Sockets;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Microsoft.Extensions.Hosting;
 using CommunityToolkit.Mvvm.ComponentModel;
 using Microsoft.Extensions.Logging;
 using VRCFaceTracking.Core.Contracts;
@@ -22,6 +24,7 @@ public partial class OscQueryService(
     MulticastDnsService multicastDnsService,
     OscRecvService recvService,
     HttpHandler httpHandler,
+    IHostApplicationLifetime lifetime,
     IDispatcherService dispatcherService)
     : ObservableObject
 {
@@ -32,6 +35,7 @@ public partial class OscQueryService(
     // (FirstClientDiscovered + OnHostInfoQueried) can dispose messages that are already queued.
     private readonly SemaphoreSlim _avatarParseLock = new(1, 1);
     private int _avatarParseGeneration;
+    private int _clientInitialized;
 
     public async Task InitializeAsync()
     {
@@ -41,18 +45,66 @@ public partial class OscQueryService(
 
         await oscTarget.LoadSettingsAsync();
 
-        (bool listenerSuccess, bool senderSuccess) result = (false, false);
-
         multicastDnsService.OnVrcClientDiscovered += FirstClientDiscovered;
 
         multicastDnsService.SendQuery("_oscjson._tcp.local");
 
-        logger.LogDebug("OSC Service Initialized with result {0}", result);
-        await Task.CompletedTask;
+        if (multicastDnsService.VrchatClientEndpoint != null)
+            FirstClientDiscovered();
+
+        if (OperatingSystem.IsLinux())
+            _ = DiscoverLocalProtonClientAsync(lifetime.ApplicationStopping);
+    }
+
+    private async Task DiscoverLocalProtonClientAsync(CancellationToken token)
+    {
+        using var http = new HttpClient(new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false })
+        {
+            Timeout = TimeSpan.FromSeconds(2)
+        };
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(token) && multicastDnsService.VrchatClientEndpoint == null)
+            {
+                try
+                {
+                    var directory = Path.GetDirectoryName(VRChat.VRCOSCDirectory);
+                    if (!Directory.Exists(directory)) continue;
+                    var log = Directory.EnumerateFiles(directory, "output_log_*.txt")
+                        .MaxBy(Path.GetFileName, StringComparer.Ordinal);
+                    if (log == null) continue;
+
+                    var advertisement = File.ReadLines(log)
+                        .Select(line => Regex.Match(line, @"Advertising Service (VRChat-Client-[\w-]+) of type OSCQuery on (\d+)\s*$"))
+                        .FirstOrDefault(match => match.Success);
+                    if (advertisement == null || !ushort.TryParse(advertisement.Groups[2].Value, out var port) || port == 0)
+                        continue;
+
+                    var endpoint = new IPEndPoint(IPAddress.Loopback, port);
+                    using var info = JsonDocument.Parse(await http.GetStringAsync($"http://{endpoint}/?HOST_INFO", token));
+                    if (!info.RootElement.TryGetProperty("NAME", out var name) ||
+                        !name.ValueEquals(advertisement.Groups[1].Value) || multicastDnsService.VrchatClientEndpoint != null)
+                        continue;
+
+                    logger.LogInformation("Found local VRChat OSCQuery endpoint in Proton log at {Endpoint}", endpoint);
+                    multicastDnsService.VrchatClientEndpoint = endpoint;
+                    FirstClientDiscovered();
+                    return;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or HttpRequestException
+                    or JsonException or InvalidOperationException or TaskCanceledException)
+                {
+                    logger.LogDebug("Local VRChat OSCQuery endpoint unavailable: {Reason}", ex.Message);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
     private void FirstClientDiscovered()
     {
+        if (Interlocked.Exchange(ref _clientInitialized, 1) != 0) return;
         multicastDnsService.OnVrcClientDiscovered -= FirstClientDiscovered;
 
         logger.LogInformation($"OSCQuery detected at {multicastDnsService.VrchatClientEndpoint}. Setting port negotiation to autopilot.");
